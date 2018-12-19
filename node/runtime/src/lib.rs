@@ -28,7 +28,7 @@ use primitives::types::{
     ReceiptTransaction, ReceiptBody, AsyncCall, CallbackResult, CallbackInfo, Callback,
     PromiseId, CallbackId, StakeTransaction, SendMoneyTransaction, CreateAccountTransaction,
     SwapKeyTransaction, DeployContractTransaction, Balance, Transaction, ShardId,
-    FunctionCallTransaction,
+    FunctionCallTransaction, Gas, Mana,
 };
 use primitives::utils::{
     account_to_shard_id, index_to_bytes
@@ -551,9 +551,13 @@ impl Runtime {
         receiver_id: AccountId,
         nonce: &[u8],
         receiver: &mut Account,
+        mana_refund: &mut Mana,
+        gas_used: &mut Gas,
     ) -> Result<Vec<Transaction>, String> {
         let staked = runtime_data.get_stake_for_account(receiver_id);
         assert!(receiver.amount >= staked);
+        *gas_used = 0;
+        *mana_refund = async_call.mana;
         let result = {
             let mut runtime_ext = RuntimeExt::new(
                 state_update,
@@ -574,18 +578,22 @@ impl Runtime {
                     receiver_id,
                     async_call.mana,
                 ),
-            ).map_err(|e| format!("wasm exeuction failed with error: {:?}", e))?;
-            let result = Self::return_data_to_receipts(
+            ).map_err(|e| format!("wasm async call preparation failed with error: {:?}", e))?;
+            *gas_used = wasm_res.gas_used;
+            *mana_refund = wasm_res.mana_left;
+            let balance = wasm_res.balance;
+            let return_data = wasm_res.return_data
+                .map_err(|e| format!("wasm async call execution failed with error: {:?}", e))?;
+            Self::return_data_to_receipts(
                 &mut runtime_ext,
-                wasm_res.return_data,                    
+                return_data,
                 &async_call.callback,
                 sender_id,
                 receiver_id,
-            );
-            if result.is_ok() {
-                receiver.amount = wasm_res.balance + staked;
-            }
-            result
+            ).and_then(|receipts| {
+                receiver.amount = balance + staked;
+                Ok(receipts)
+            })
         };
         set(
             state_update,
@@ -604,10 +612,14 @@ impl Runtime {
         receiver_id: AccountId,
         nonce: &[u8],
         receiver: &mut Account,
+        mana_refund: &mut Mana,
+        gas_used: &mut Gas,
     ) -> Result<Vec<Transaction>, String> {
         let staked = runtime_data.get_stake_for_account(receiver_id);
         assert!(receiver.amount >= staked);
         let mut needs_removal = false;
+        *mana_refund = 0;
+        *gas_used = 0;
         let receipts = {
             let mut runtime_ext = RuntimeExt::new(
                 state_update,
@@ -621,6 +633,8 @@ impl Runtime {
                     callback.result_counter += 1;
                     // if we have gathered all results, execute the callback
                     if callback.result_counter == callback.results.len() {
+                        *mana_refund = callback.mana;
+                        needs_removal = true;
                         let wasm_res = executor::execute(
                             &receiver.code,
                             &callback.method_name,
@@ -635,12 +649,15 @@ impl Runtime {
                                 receiver_id,
                                 callback.mana,
                             ),
-                        ).map_err(|e| format!("wasm exeuction failed with error: {:?}", e))?;
-                        needs_removal = true;
+                        ).map_err(|e| format!("wasm callback preparation failed with error: {:?}", e))?;
+                        *gas_used = wasm_res.gas_used;
+                        *mana_refund = wasm_res.mana_left;
                         let balance = wasm_res.balance;
+                        let return_data = wasm_res.return_data
+                            .map_err(|e| format!("wasm callback execution failed with error: {:?}", e))?;
                         Self::return_data_to_receipts(
                             &mut runtime_ext,
-                            wasm_res.return_data,
+                            return_data,
                             &callback.callback,
                             sender_id,
                             receiver_id,
@@ -688,6 +705,8 @@ impl Runtime {
         let mut amount = 0;
         let mut callback_info = None;
         let mut receiver_exists = true;
+        let mut mana_refund: Mana = 0;
+        let mut gas_used: Gas = 0;
         let result = match receiver {
             Some(mut receiver) => {
                 match &receipt.body {
@@ -737,6 +756,8 @@ impl Runtime {
                                 receipt.receiver,
                                 &receipt.nonce,
                                 &mut receiver,
+                                &mut mana_refund,
+                                &mut gas_used,
                             )
                         }
                     },
@@ -750,6 +771,8 @@ impl Runtime {
                             receipt.receiver,
                             &receipt.nonce,
                             &mut receiver,
+                            &mut mana_refund,
+                            &mut gas_used,
                         )
                     }
                     ReceiptBody::Refund(amount) => {
@@ -788,6 +811,7 @@ impl Runtime {
                 }
             }
         };
+        // TODO(#259): Create mana and gas receipt.
         match result {
             Ok(mut receipts) => {
                 new_receipts.append(&mut receipts);
